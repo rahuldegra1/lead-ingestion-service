@@ -1,0 +1,27 @@
+[
+  {
+    "csv_row": 3,
+    "input_data": {
+      "full_name": "priya verma",
+      "email": "priya_at_yahoo.com",
+      "budget_inr": "20000",
+      "phone": "12345"
+    },
+    "errors": [
+      "Value error, Invalid email: missing '@' symbol",
+      "Value error, Phone number must contain exactly 10 digits"
+    ]
+  },
+  {
+    "csv_row": 4,
+    "input_data": {
+      "full_name": "rohit kumar",
+      "email": "rohit@company.in",
+      "budget_inr": "-500",
+      "phone": "9876543210"
+    },
+    "errors": [
+      "Input should be greater than 0"
+    ]
+  }
+]

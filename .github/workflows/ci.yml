@@ -1,0 +1,135 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install ruff pytest httpx
+
+      - name: Run Ruff Linter
+        run: ruff check .
+
+      - name: Run Ruff Formatter Check
+        run: ruff format --check .
+
+      - name: Run Pytest Suite
+        run: pytest -v
+
+  docker-smoke-test:
+    name: Docker Build & Health Check
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Start stack via Docker Compose
+        run: docker compose up -d --build
+
+      - name: Poll /health readiness probe
+        run: |
+          echo "Waiting for PostgreSQL migrations and FastAPI health..."
+          timeout 60 bash -c 'until curl -sf http://localhost:8000/health | grep -q "\"status\":\"healthy\""; do sleep 2; done'
+          echo "FastAPI and PostgreSQL are healthy!"
+
+      - name: Smoke test lead ingestion and rate limiting
+        run: |
+          set -e
+
+          echo "=== 1. Testing valid lead ingestion (Expect 200/201) ==="
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8000/leads \
+            -H "Content-Type: application/json" \
+            -H "X-API-Key: prod-secret-lead-ingest-key-2026" \
+            -d '{"full_name":"CI Tester","email":"ci@test.com","phone":"9876543210","budget_inr":"100000"}')
+          echo "Status: $STATUS"
+          if [ "$STATUS" -ne 200 ] && [ "$STATUS" -ne 201 ]; then
+            echo "Expected 200/201 for valid lead, got $STATUS"
+            exit 1
+          fi
+
+          echo "=== 2. Testing missing API key (Expect 401/403) ==="
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8000/leads \
+            -H "Content-Type: application/json" \
+            -d '{"full_name":"No Auth","email":"noauth@test.com","phone":"9876543210","budget_inr":"100000"}')
+          echo "Status: $STATUS"
+          if [ "$STATUS" -ne 401 ] && [ "$STATUS" -ne 403 ]; then
+            echo "Expected 401 or 403 for missing API key, got $STATUS"
+            exit 1
+          fi
+
+          echo "=== 3. Testing invalid API key (Expect 401/403) ==="
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8000/leads \
+            -H "Content-Type: application/json" \
+            -H "X-API-Key: invalid-tampered-token-xyz" \
+            -d '{"full_name":"Bad Auth","email":"badauth@test.com","phone":"9876543210","budget_inr":"100000"}')
+          echo "Status: $STATUS"
+          if [ "$STATUS" -ne 401 ] && [ "$STATUS" -ne 403 ]; then
+            echo "Expected 401 or 403 for invalid API key, got $STATUS"
+            exit 1
+          fi
+
+          echo "=== 4. Testing invalid payload schema (Expect 422 Unprocessable Entity) ==="
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8000/leads \
+            -H "Content-Type: application/json" \
+            -H "X-API-Key: prod-secret-lead-ingest-key-2026" \
+            -d '{"full_name":"","email":"not-a-valid-email","phone":"","budget_inr":"invalid_num"}')
+          echo "Status: $STATUS"
+          if [ "$STATUS" -ne 422 ]; then
+            echo "Expected 422 for invalid schema payload, got $STATUS"
+            exit 1
+          fi
+
+          echo "=== 5. Testing rate-limit trigger (Expect 429 Too Many Requests) ==="
+          RATE_LIMITED=false
+          for i in $(seq 1 25); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8000/leads \
+              -H "Content-Type: application/json" \
+              -H "X-API-Key: prod-secret-lead-ingest-key-2026" \
+              -d "{\"full_name\":\"Spam $i\",\"email\":\"spam$i@test.com\",\"phone\":\"9876543210\",\"budget_inr\":\"50000\"}")
+            if [ "$CODE" -eq 429 ]; then
+              echo "Rate limit tripped successfully on request #$i with HTTP 429"
+              RATE_LIMITED=true
+              break
+            fi
+          done
+
+          if [ "$RATE_LIMITED" = false ]; then
+            echo "Rate limit was never triggered after 25 rapid requests"
+            exit 1
+          fi
+
+      - name: Verify Prometheus metrics scrape
+        run: |
+          echo "Verifying /metrics exposition..."
+          curl -sf http://localhost:8000/metrics | grep -E "(http_requests_total|http_request_duration_seconds)"
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Teardown container stack
+        if: always()
+        run: docker compose down -v
